@@ -1,58 +1,71 @@
-from langchain.tools import tool
-from langchain.agents import create_agent
-from langchain.messages import HumanMessage
+"""
+Personal Assistant with Sub-Agents (Supervisor pattern).
+Run the supervisor with a query; it routes to calendar or email sub-agents as needed.
+"""
+import os
+import sys
 
-from agents import (
-    model_gemini,
-    run_flight_agent,
-    run_hotel_agent,
-    run_budget_agent,
-)
+# Check API key before importing agents (agents create the model at import time)
+if not os.environ.get("OPENROUTER_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
+    print("Set OPENROUTER_API_KEY or OPENAI_API_KEY in the environment.")
+    print("Example: export OPENAI_API_KEY=sk-...")
+    sys.exit(1)
 
-@tool
-def plan_flight(request: str) -> str:
-    """Plan or book flights using natural language."""
-    return run_flight_agent(request)
+from langchain_core.messages import HumanMessage
 
-@tool
-def plan_hotel(request: str) -> str:
-    """Plan or book hotels using natural language."""
-    return run_hotel_agent(request)
+from agents import supervisor_agent
 
-@tool
-def check_budget(request: str) -> str:
-    """Check if a proposed trip fits the budget."""
-    return run_budget_agent(request)
 
-SUPERVISOR_PROMPT = (
-    "You are a travel planning supervisor agent. "
-    "You can coordinate three capabilities: flights, hotels, and budget evaluation. "
-    "Use plan_flight for flight-related actions, plan_hotel for lodging, "
-    "and check_budget to verify the plan against a given budget. "
-    "Break down complex travel requests into multiple tool calls when needed, "
-    "and then synthesize a final, coherent travel plan in your answer. "
-    "Clearly separate sections for Flights, Hotels, and Budget in the final response."
-)
+def run_query(query: str):
+    """Send a query to the supervisor and print the conversation."""
+    result = supervisor_agent.invoke({"messages": [HumanMessage(content=query)]})
+    messages = result.get("messages", [])
+    for msg in messages:
+        _print_message(msg)
+    return result
 
-supervisor_agent = create_agent(
-    model=model_gemini,
-    tools=[plan_flight, plan_hotel, check_budget],
-    system_prompt=SUPERVISOR_PROMPT,
-)
+
+def _print_message(msg):
+    """Pretty-print a single message (Human, AI, or Tool)."""
+    cls = type(msg).__name__
+    if "Human" in cls:
+        print("\n======== Human ========\n")
+        print(getattr(msg, "content", msg))
+    elif "AI" in cls or "AIMessage" in cls:
+        print("\n======== AI ========\n")
+        content = getattr(msg, "content", None)
+        tool_calls = getattr(msg, "tool_calls", []) or []
+        if tool_calls:
+            for tc in tool_calls:
+                name = tc.get("name", "?")
+                args = tc.get("args", {})
+                print(f"Tool: {name}")
+                print(f"Args: {args}")
+        if content:
+            print(content)
+    elif "Tool" in cls:
+        print("\n======== Tool result ========\n")
+        print(getattr(msg, "content", msg))
+    print()
+
+
+def main():
+    if len(sys.argv) > 1:
+        query = " ".join(sys.argv[1:])
+        run_query(query)
+        return
+
+    # Demo: single-domain and multi-domain
+    print("=== Example 1: Schedule only ===")
+    run_query("Schedule a team standup for tomorrow at 9am")
+
+    print("\n" + "=" * 60)
+    print("=== Example 2: Schedule + Email ===")
+    run_query(
+        "Schedule a meeting with the design team next Tuesday at 2pm for 1 hour, "
+        "and send them an email reminder about reviewing the new mockups."
+    )
+
 
 if __name__ == "__main__":
-    q1 = "Find me a flight from Riyadh to Tokyo around June 10 under $800."
-    r1 = supervisor_agent.invoke({"messages": [HumanMessage(q1)]})
-    print("=== Example 1 ===")
-    for m in r1.get("messages", []):
-        print(m.type.upper(), ":\n", getattr(m, "text", ""), "\n")
-
-    q2 = (
-        "Plan a 5-day trip to Tokyo from Riyadh around June 10. "
-        "Find a reasonable flight and a mid-range hotel in Shinjuku. "
-        "Keep the total trip under $2000."
-    )
-    r2 = supervisor_agent.invoke({"messages": [HumanMessage(q2)]})
-    print("=== Example 2 ===")
-    for m in r2.get("messages", []):
-        print(m.type.upper(), ":\n", getattr(m, "text", ""), "\n")
+    main()

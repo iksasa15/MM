@@ -1,76 +1,132 @@
-import google.generativeai as genai
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain.agents import create_agent
-from langchain.messages import HumanMessage
+"""
+Sub-agents (calendar, email) and supervisor agent.
+Sub-agents are wrapped as tools so the supervisor can route to them.
+"""
+import os
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
 
 from tools import (
-    search_flights,
-    book_flight,
-    search_hotels,
-    book_hotel,
-    estimate_trip_cost,
+    create_calendar_event,
+    get_available_time_slots,
+    send_email,
 )
 
-# اكتب مفتاح Gemini هنا مباشرة (استبدل النص بين علامات التنصيص)
-GEMINI_API_KEY = "AIzaSyD78kK36D92yf2Fq0OQ6Jv1ZvR9k8QZuEI"
 
-genai.configure(api_key=GEMINI_API_KEY)
+def _get_model():
+    """Chat model: OpenRouter (Nemotron) or OpenAI."""
+    api_key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "Set OPENROUTER_API_KEY or OPENAI_API_KEY in the environment."
+        )
+    if os.environ.get("OPENROUTER_API_KEY"):
+        return ChatOpenAI(
+            model="nvidia/nemotron-3-nano-30b-a3b:free",
+            temperature=0,
+            base_url="https://openrouter.ai/api/v1",
+            api_key=api_key,
+        )
+    return ChatOpenAI(model="gpt-4o-mini", temperature=0, api_key=api_key)
 
-model_gemini = ChatGoogleGenerativeAI(
-    model="gemini-1.5-flash",
-    temperature=0,
+
+def _create_agent(model, tools, system_prompt):
+    """Create an agent graph (tool-calling loop) using LangChain's create_agent."""
+    try:
+        from langchain.agents import create_agent
+    except ImportError:
+        from langgraph.prebuilt import create_react_agent as _create_react
+        graph = _create_react(model, tools)
+        # wrap so we have same invoke interface: {"messages": [...]} -> state with messages
+        return graph
+    return create_agent(
+        model=model,
+        tools=tools,
+        system_prompt=system_prompt,
+    )
+
+
+# --- Calendar sub-agent ---
+CALENDAR_AGENT_PROMPT = (
+    "You are a calendar scheduling assistant. "
+    "Parse natural language scheduling requests (e.g., 'next Tuesday at 2pm') "
+    "into proper ISO datetime formats. "
+    "Use get_available_time_slots to check availability when needed. "
+    "Use create_calendar_event to schedule events. "
+    "Always confirm what was scheduled in your final response."
 )
 
-FLIGHT_AGENT_PROMPT = (
-    "You are a flight booking assistant. "
-    "You help users find and book flights using natural language requests. "
-    "Parse dates, cities, and budget into proper parameters. "
-    "Use search_flights to find options and summarize them clearly. "
-    "When the user explicitly asks to book, call book_flight with the chosen offer_id. "
-    "Always explain your choice and show price and duration."
+calendar_agent = _create_agent(
+    _get_model(),
+    tools=[create_calendar_event, get_available_time_slots],
+    system_prompt=CALENDAR_AGENT_PROMPT,
 )
 
-flight_agent = create_agent(
-    model=model_gemini,
-    tools=[search_flights, book_flight],
-    system_prompt=FLIGHT_AGENT_PROMPT,
+# --- Email sub-agent ---
+EMAIL_AGENT_PROMPT = (
+    "You are an email assistant. "
+    "Compose professional emails based on natural language requests. "
+    "Extract recipient information and craft appropriate subject lines and body text. "
+    "Use send_email to send the message. "
+    "Always confirm what was sent in your final response."
 )
 
-HOTEL_AGENT_PROMPT = (
-    "You are a hotel booking assistant. "
-    "You choose suitable hotels based on location, budget, and dates. "
-    "Use search_hotels to find candidates. "
-    "When the user confirms booking, call book_hotel. "
-    "Always summarize hotel name, area, rating, and price per night."
+email_agent = _create_agent(
+    _get_model(),
+    tools=[send_email],
+    system_prompt=EMAIL_AGENT_PROMPT,
 )
 
-hotel_agent = create_agent(
-    model=model_gemini,
-    tools=[search_hotels, book_hotel],
-    system_prompt=HOTEL_AGENT_PROMPT,
+
+# --- Wrap sub-agents as tools for the supervisor ---
+@tool
+def schedule_event(request: str) -> str:
+    """Schedule calendar events using natural language.
+
+    Use this when the user wants to create, modify, or check calendar appointments.
+    Handles date/time parsing, availability checking, and event creation.
+
+    Input: Natural language scheduling request (e.g., 'meeting with design team
+    next Tuesday at 2pm')
+    """
+    result = calendar_agent.invoke({"messages": [HumanMessage(content=request)]})
+    messages = result.get("messages", result) if isinstance(result, dict) else getattr(result, "messages", [])
+    if not messages:
+        return "No response from calendar agent."
+    last = messages[-1]
+    return getattr(last, "content", str(last)) or "Done."
+
+
+@tool
+def manage_email(request: str) -> str:
+    """Send emails using natural language.
+
+    Use this when the user wants to send notifications, reminders, or any email
+    communication. Handles recipient extraction, subject generation, and email
+    composition.
+
+    Input: Natural language email request (e.g., 'send them a reminder about
+    the meeting')
+    """
+    result = email_agent.invoke({"messages": [HumanMessage(content=request)]})
+    messages = result.get("messages", result) if isinstance(result, dict) else getattr(result, "messages", [])
+    if not messages:
+        return "No response from email agent."
+    last = messages[-1]
+    return getattr(last, "content", str(last)) or "Done."
+
+
+# --- Supervisor agent ---
+SUPERVISOR_PROMPT = (
+    "You are a helpful personal assistant. "
+    "You can schedule calendar events and send emails. "
+    "Break down user requests into appropriate tool calls and coordinate the results. "
+    "When a request involves multiple actions, use multiple tools in sequence."
 )
 
-BUDGET_AGENT_PROMPT = (
-    "You are a budget assistant for trips. "
-    "You combine flight and hotel costs and compare with the user budget. "
-    "Use estimate_trip_cost to compute totals. "
-    "Explain clearly whether the plan fits the budget or suggest adjustments."
+supervisor_agent = _create_agent(
+    _get_model(),
+    tools=[schedule_event, manage_email],
+    system_prompt=SUPERVISOR_PROMPT,
 )
-
-budget_agent = create_agent(
-    model=model_gemini,
-    tools=[estimate_trip_cost],
-    system_prompt=BUDGET_AGENT_PROMPT,
-)
-
-def run_flight_agent(request: str) -> str:
-    result = flight_agent.invoke({"messages": [HumanMessage(request)]})
-    return result["messages"][-1].text
-
-def run_hotel_agent(request: str) -> str:
-    result = hotel_agent.invoke({"messages": [HumanMessage(request)]})
-    return result["messages"][-1].text
-
-def run_budget_agent(request: str) -> str:
-    result = budget_agent.invoke({"messages": [HumanMessage(request)]})
-    return result["messages"][-1].text

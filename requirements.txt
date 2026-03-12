@@ -1,0 +1,6 @@
+# Personal Assistant with Sub-Agents (Supervisor Pattern)
+# LangChain + OpenAI/OpenRouter
+langchain>=0.3.0
+langchain-openai>=0.2.0
+langchain-core>=0.3.0
+langgraph>=0.2.0
